@@ -6,7 +6,10 @@
 #   2.  Provide perceptual brightness mapping so very low but non-off levels
 #       (raw 1..) are reachable and high end is slightly compressed.
 
+import contextlib
 import logging
+import math
+import time
 
 from zigpy.quirks.v2 import QuirkBuilder
 from zigpy.zcl.clusters.general import LevelControl as ZigpyLevelControl
@@ -17,59 +20,57 @@ from zhaquirks import CustomCluster
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.warning("Loading Third Reality ZL1 smart color bulb quirk module")
 
-# Target fingerprint (gating)
+# Target fingerprint
 TARGET_MANUFACTURER = "Third Reality, Inc"
 TARGET_MODEL = "3RCB01057Z"
-# Set to e.g. "1.00.66" to enforce firmware, or leave as None to disable FW gating.
-TARGET_SW_BUILD_ID = None  # "1.00.66"
 
 # ZCL constants
 CMD_MOVE_TO_LEVEL = 0x00
 CMD_MOVE_TO_LEVEL_WITH_ON_OFF = 0x04
-CMD_MOVE_WITH_ON_OFF = 0x05
 CMD_STEP = 0x02
 CMD_STEP_WITH_ON_OFF = 0x06
 CMD_MOVE_TO_COLOR_TEMP = 0x0A
+CMD_MOVE_TO_COLOR = 0x07
+CMD_MOVE_TO_HUE_SAT = 0x06
+CMD_ENHANCED_MOVE_TO_HUE_SAT = 0x43  # ZCL enhanced command
 
 ATTR_CURRENT_LEVEL = 0x0000
 ATTR_COLOR_TEMP = 0x0007
-ATTR_COLOR_CAPS = 0x400A  # left for reference; no longer overridden
 ATTR_CT_MIN = 0x400B
 ATTR_CT_MAX = 0x400C
+ATTR_CURRENT_X = 0x0003
+ATTR_CURRENT_Y = 0x0004
+ATTR_COLOR_MODE = 0x0008
 
-# LevelControl.StepMode (ZCL 0x0008 Level Control): Up=0x00, Down=0x01
 STEP_MODE_UP = 0x00
 STEP_MODE_DOWN = 0x01
 
-# Logical color temperature range (shown to HA)
 LOGICAL_MIN_MIRED = 154  # ~6500 K (cool)
 LOGICAL_MAX_MIRED = 370  # ~2700 K (warm)
 
-# Device command range (actual on-wire)
 DEVICE_MIN_MIRED = 142
 DEVICE_MAX_MIRED = 454
 
-## No FIXED_COLOR_CAPABILITIES needed (firmware now advertises correctly)
-
-# Brightness perceptual mapping
-# HA typically uses 3..254
-HA_MIN_LEVEL_INPUT = 3
+HA_MIN_LEVEL_INPUT = 3  # HA normally emits 3..254 for brightness writes
 HA_MAX_LEVEL_INPUT = 254
-DEVICE_LEVEL_MIN = 0
+DEVICE_LEVEL_MIN = 0  # Allow 0 only for explicit OFF
 DEVICE_LEVEL_MAX = 254
 
-MIN_LEVEL = 0
-MAX_LEVEL = 254
+MIN_LEVEL = 0  # HA domain minimum (OFF semantic)
+MAX_LEVEL = 254  # HA domain maximum
 DEFAULT_LEVEL = 128
 DEFAULT_TRANSITION_TIME = 0
+DEFAULT_COLOR_TRANSITION_TENTHS = 4
+STICKY_WINDOW_S = 2.8  # echo last HA value for this many seconds after a set (cover group refresh debounce)
+HYSTERESIS_COUNTS = 3  # device-level tolerance for stickiness
 
+BRIGHTNESS_THRESHOLD_PERCENT = (
+    50  # Percent threshold between linear percent zone and curve
+)
+START_SLOPE_NORM = 1.0  # Hermite start derivative at threshold
+END_SLOPE_NORM = 0.35  # Hermite end derivative (tunable)
 
-GAMMA_LOW = 2.2  # growth below knee (higher = more low-end resolution)
-GAMMA_HIGH = 1.4  # growth above knee (>=1 compresses highs)
-KNEE_IN = 25  # HA brightness at knee (0..255 scale)
-KNEE_OUT = 0.18  # output fraction at knee (0..1), puts extra codes below knee
-LOW_END_PIN_MAX = 50
-EPSILON = 1e-6
+UV_CT_SNAP_EPSILON = 0.015  # u'v' distance threshold to snap to CT (preferred)
 
 
 def _clamp_value(x, lo, hi):
@@ -87,181 +88,498 @@ def _linear_map(x, a, b, c, d):
     return c + (x - a) * (d - c) / (b - a)
 
 
-def _map_ha_brightness_to_device(req: int, *, log: bool = True) -> int:
-    """Map HA brightness (3..254) to device level (1..254) with a perceptual curve.
+def _ha_raw_to_percent(ha: int) -> int:
+    """Approximate HA percent (1..100) from HA raw brightness (1..254).
 
-    log: set False to suppress warning log (used during LUT construction).
+    Home Assistant typically derives raw from percent with rounding: raw ≈ round(p/100 * 255).
+    We invert: percent ≈ round(raw * 100 / 255). Guarantee minimum 1 for any non-zero raw.
     """
-    try:
-        v = int(req)
-    except Exception:
-        return req
-
-    # Allow explicit 0 to pass through (true OFF intent).
-    if v == 0:
+    if ha <= 0:
         return 0
-
-    # Clamp positive requests at/under HA_MIN_IN to device 1.
-    if 0 < v <= HA_MIN_LEVEL_INPUT:
-        return 1
-
-    # Low-end linear pinning
-    if v <= LOW_END_PIN_MAX:
-        # Ensure 1..PIN_RAW_MAX never yields 0
-        return max(1, v)
-
-    # Normalize to 0..1 over [HA_MIN_IN..HA_MAX_IN]
-    n = (v - HA_MIN_LEVEL_INPUT) / (HA_MAX_LEVEL_INPUT - HA_MIN_LEVEL_INPUT)
-    n = _clamp_value(n, 0.0, 1.0)
-
-    # Knee/gamma
-    knee_n = _clamp_value(
-        (KNEE_IN - HA_MIN_LEVEL_INPUT) / (HA_MAX_LEVEL_INPUT - HA_MIN_LEVEL_INPUT),
-        0.0,
-        1.0,
-    )
-    knee_out = _clamp_value(KNEE_OUT, 0.0, 1.0)
-
-    if abs(knee_n - 0.0) < EPSILON:
-        y = n**GAMMA_HIGH
-    elif n <= knee_n:
-        y = 0.0 if abs(knee_n - 0.0) < EPSILON else (n / knee_n) ** GAMMA_LOW * knee_out
-    elif abs(knee_n - 1.0) < EPSILON:
-        y = knee_out
-    else:
-        t = (n - knee_n) / (1.0 - knee_n)
-        y = knee_out + (t**GAMMA_HIGH) * (1.0 - knee_out)
-
-    # Scale to device domain
-    dev = int(round(_linear_map(y, 0.0, 1.0, DEVICE_LEVEL_MIN, DEVICE_LEVEL_MAX)))
-
-    # Avoid 0 for a positive request
-    if dev == 0 and v > 0:
-        dev = 1
-
-    mapped = _clamp_value(dev, 0, DEVICE_LEVEL_MAX)
-    if v != mapped:
-        dev = mapped
-    if log:
-        _LOGGER.warning(
-            "_map_ha_brightness_to_device: ha=%s device=%s (req=%s)",
-            v,
-            dev,
-            req,
-        )
-    return dev
+    p = int(round(ha * 100.0 / 255.0))
+    if p == 0:
+        p = 1
+    p = 100 if p > 100 else p
+    return p
 
 
-def _map_device_brightness_to_ha(dev: int, *, log: bool = True) -> int:
-    """Inverse mapping for stable sliders (device level -> HA level).
+def _hermite_ease(x: float, d0: float, d1: float) -> float:
+    """Cubic Hermite interpolation on [0,1] with endpoints (0,0),(1,1)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    x2 = x * x
+    x3 = x2 * x
+    h10 = x3 - 2 * x2 + x  # *d0
+    h01 = -2 * x3 + 3 * x2  # *1
+    h11 = x3 - x2  # *d1
+    return h10 * d0 + h01 + h11 * d1
 
-    log: set False to suppress warning log (not currently called in LUT build).
+
+def _build_new_brightness_tables():  # noqa: C901
+    """Construct forward/inverse brightness LUTs using percent-based low segment.
+
+    Forward domain: HA raw 0..254 -> device raw 0..254
+      * Convert HA raw -> percent p (0..100)
+      * If p <= threshold: device_raw = p
+      * Else apply Hermite easing over p in (threshold..100] mapping to
+        [threshold .. DEVICE_LEVEL_MAX].
+    Inverse maps device raw back to representative HA raw (first producing HA).
     """
-    original = dev
-    dev = _clamp_value(int(dev), DEVICE_LEVEL_MIN, DEVICE_LEVEL_MAX)
+    ha2dev = [0] * (MAX_LEVEL + 1)
 
-    # Low-end linear pinning reflection
-    if dev <= LOW_END_PIN_MAX:
-        return _clamp_value(
-            max(HA_MIN_LEVEL_INPUT, dev), HA_MIN_LEVEL_INPUT, HA_MAX_LEVEL_INPUT
+    # Precompute anchor and auto-fit start slope for C1 continuity (dr/dp = 1)
+    anchor_raw = BRIGHTNESS_THRESHOLD_PERCENT  # device raw at threshold percent
+    curve_range = DEVICE_LEVEL_MAX - anchor_raw
+    percent_span = 100 - BRIGHTNESS_THRESHOLD_PERCENT
+    # dy/dx at x=0 for Hermite so that dr/dp = 1 at threshold:
+    # dr/dp = curve_range * (dy/dx) * (1/percent_span) => dy/dx = percent_span/curve_range
+    d0 = (percent_span / curve_range) if curve_range > 0 else 0.0
+    for ha in range(0, MAX_LEVEL + 1):
+        if ha == 0:
+            ha2dev[ha] = 0
+            continue
+        p = _ha_raw_to_percent(ha)
+        if p <= BRIGHTNESS_THRESHOLD_PERCENT:
+            mapped = 1 if p <= 2 else p
+        else:
+            # Normalized progress across percent domain
+            x = (p - BRIGHTNESS_THRESHOLD_PERCENT) / percent_span
+            y = _hermite_ease(x, d0, END_SLOPE_NORM)
+            mapped = anchor_raw + y * curve_range
+        ha2dev[ha] = _clamp_value(
+            int(round(mapped)), DEVICE_LEVEL_MIN, DEVICE_LEVEL_MAX
         )
+        # Ensure monotonic (allow plateaus for equal percents; no forced +1)
+        if ha > 0 and ha2dev[ha] < ha2dev[ha - 1]:
+            ha2dev[ha] = ha2dev[ha - 1]
 
-    y = (dev - DEVICE_LEVEL_MIN) / (DEVICE_LEVEL_MAX - DEVICE_LEVEL_MIN)
-    knee_n = _clamp_value(
-        (KNEE_IN - HA_MIN_LEVEL_INPUT) / (HA_MAX_LEVEL_INPUT - HA_MIN_LEVEL_INPUT),
-        0.0,
-        1.0,
-    )
-    knee_out = _clamp_value(KNEE_OUT, 0.0, 1.0)
+    # Guarantee final convergence
+    ha2dev[MAX_LEVEL] = DEVICE_LEVEL_MAX
 
-    if abs(knee_n - 0.0) < EPSILON:
-        n = y ** (1.0 / GAMMA_HIGH)
-    elif y <= knee_out:
-        n = (
-            0.0
-            if abs(knee_out - 0.0) < EPSILON
-            else (y / knee_out) ** (1.0 / GAMMA_LOW) * knee_n
-        )
-    elif abs(1.0 - knee_out) < EPSILON:
-        n = knee_n
-    else:
-        t = (y - knee_out) / (1.0 - knee_out)
-        n = knee_n + (t ** (1.0 / GAMMA_HIGH)) * (1.0 - knee_n)
-
-    ha = int(round(_linear_map(n, 0.0, 1.0, HA_MIN_LEVEL_INPUT, HA_MAX_LEVEL_INPUT)))
-    ha_mapped = _clamp_value(ha, HA_MIN_LEVEL_INPUT, HA_MAX_LEVEL_INPUT)
-    if log:
-        _LOGGER.warning(
-            "_map_device_brightness_to_ha: device=%s clamped_device=%s ha=%s mapped_ha=%s",
-            original,
-            dev,
-            ha,
-            ha_mapped,
-        )
-    return ha_mapped
+    # Inverse: first HA producing raw assigned
+    dev2ha = [0] * (DEVICE_LEVEL_MAX + 1)
+    for ha in range(0, MAX_LEVEL + 1):
+        raw = ha2dev[ha]
+        if raw <= DEVICE_LEVEL_MAX and dev2ha[raw] == 0:
+            dev2ha[raw] = ha
+    # Forward fill gaps
+    last = 0
+    for d in range(DEVICE_LEVEL_MAX + 1):
+        if dev2ha[d] == 0 and d != 0:
+            dev2ha[d] = last
+        else:
+            last = dev2ha[d]
+    return ha2dev, dev2ha
 
 
-# Color cluster
+# Precompute global tables once at import
+BRIGHTNESS_HA2DEV, BRIGHTNESS_DEV2HA = _build_new_brightness_tables()
+_LOGGER.warning(
+    "Brightness tables (percent-based) built: threshold_percent=%s anchor_raw=%s",
+    BRIGHTNESS_THRESHOLD_PERCENT,
+    BRIGHTNESS_HA2DEV[int(round(BRIGHTNESS_THRESHOLD_PERCENT / 100 * 255))],
+)
 
 
 class Color(CustomCluster, ZigpyColor):
-    """Custom Color cluster with CT mapping and XY capability fixes."""
-
-    cluster_id = ZigpyColor.cluster_id
+    """Custom Color cluster with CT mapping and CT snapping."""
 
     LOG_MIN = LOGICAL_MIN_MIRED  # 154
     LOG_MAX = LOGICAL_MAX_MIRED  # 370
     DEV_MIN = DEVICE_MIN_MIRED  # 142
     DEV_MAX = DEVICE_MAX_MIRED  # 454
 
-    # Gating
-    def _active(self) -> bool:
-        dev = getattr(self.endpoint, "device", None)
-        if not dev:
-            return False
-        if getattr(dev, "manufacturer", "") != TARGET_MANUFACTURER:
-            return False
-        if getattr(dev, "model", "") != TARGET_MODEL:
-            return False
-        if TARGET_SW_BUILD_ID:
-            sw = getattr(dev, "sw_build_id", "") or getattr(
-                dev, "software_build_id", ""
-            )
-            if sw != TARGET_SW_BUILD_ID:
-                return False
-        return True
-
     def __init__(self, *args, **kwargs):
         """Initialize cluster and seed cache with corrected limits/capabilities."""
         super().__init__(*args, **kwargs)
-        if self._active():
-            # Seed cache for corrected CT limits only
-            super()._update_attribute(ATTR_CT_MIN, self.LOG_MIN)
-            super()._update_attribute(ATTR_CT_MAX, self.LOG_MAX)
-            _LOGGER.warning(
-                "Color.__init__: active=True logical_ct_limits=%s-%s device_ct_limits=%s-%s",
-                self.LOG_MIN,
-                self.LOG_MAX,
-                self.DEV_MIN,
-                self.DEV_MAX,
+        # Seed cache for corrected CT limits only
+        super()._update_attribute(ATTR_CT_MIN, self.LOG_MIN)
+        super()._update_attribute(ATTR_CT_MAX, self.LOG_MAX)
+        # Default color_mode unknown initially; leave as-is until first set
+        _LOGGER.warning(
+            "Color.__init__: logical_ct_limits=%s-%s device_ct_limits=%s-%s",
+            self.LOG_MIN,
+            self.LOG_MAX,
+            self.DEV_MIN,
+            self.DEV_MAX,
+        )
+
+    def _map_ct_logical_to_device(self, mired: int) -> int:
+        return self._convert_logical_mireds_to_device(mired)
+
+    def _map_ct_device_to_logical(self, dev_mired: int) -> int:
+        return self._convert_device_mireds_to_logical(dev_mired)
+
+    def _nearest_ct_uv(self, x: float, y: float):
+        mired, dist_uv, _ = self._nearest_ct_in_uv(x, y)
+        m = mired if mired is not None else self.LOG_MIN
+        d = dist_uv if dist_uv is not None else float("inf")
+        return int(m), float(d)
+
+    def _should_snap_to_ct(self, x: float, y: float):
+        """Pure decision helper: decide if xy should snap to CT.
+
+        Returns a dict: { snap: bool, mired: int, uv_dist: float, epsilon: float, reason: str }
+        No logging and no state changes.
+        """
+        mired, dist_uv = self._nearest_ct_uv(x, y)
+        snapped = bool(dist_uv <= UV_CT_SNAP_EPSILON)
+        return {
+            "snap": snapped,
+            "mired": int(mired),
+            "uv_dist": float(dist_uv),
+            "epsilon": float(UV_CT_SNAP_EPSILON),
+            "reason": "uv<=epsilon" if snapped else "uv>epsilon",
+        }
+
+    async def _emit_move_to_ct(self, dev_mired: int, transition: int):
+        return await super().command(
+            CMD_MOVE_TO_COLOR_TEMP, int(dev_mired), int(transition)
+        )
+
+    async def _emit_move_to_xy(self, x16: int, y16: int, transition: int):
+        return await super().command(
+            CMD_MOVE_TO_COLOR, int(x16), int(y16), int(transition)
+        )
+
+    def _log_ct_cmd(self, command_id, logical_mired, dev_mired):
+        _LOGGER.warning(
+            "Color.command: cmd=0x%02X logical_ct=%s -> device_ct=%s",
+            command_id,
+            logical_mired,
+            dev_mired,
+        )
+
+    def _log_xy_ct_snap(
+        self, x_in, y_in, xc, yc, uv_dist, mired, dev_mired, epsilon, trans
+    ):
+        _LOGGER.warning(
+            "Color.command: XY->CT snap: in=(%s,%s) xy=(%.4f,%.4f) locus_uv_dist=%.4f mired=%s dev_mired=%s eps=%.4f trans=%s",
+            x_in,
+            y_in,
+            xc,
+            yc,
+            uv_dist,
+            mired,
+            dev_mired,
+            epsilon,
+            trans,
+        )
+
+    def _log_xy_no_snap(self, uv_dist, epsilon, xc, yc):
+        _LOGGER.warning(
+            "Color.command: XY no-snap: locus_uv_dist=%.4f > eps=%.4f (x=%.4f,y=%.4f)",
+            uv_dist,
+            epsilon,
+            xc,
+            yc,
+        )
+
+    def _log_hs_ct_snap(
+        self, h_deg, s_raw, xc, yc, uv_dist, mired, dev_mired, epsilon, trans
+    ):
+        _LOGGER.warning(
+            "Color.command: HS->XY->CT snap: h_deg=%s s_raw=%s -> xy=(%.4f,%.4f) locus_uv_dist=%.4f mired=%s dev_mired=%s eps=%.4f trans=%s",
+            int(round(h_deg)),
+            int(round(s_raw)),
+            xc,
+            yc,
+            uv_dist,
+            mired,
+            dev_mired,
+            epsilon,
+            trans,
+        )
+
+    def _log_hs_no_snap(self, uv_dist, epsilon, xc, yc):
+        _LOGGER.warning(
+            "Color.command: HS->XY no-snap: locus_uv_dist=%.4f > eps=%.4f (x=%.4f,y=%.4f)",
+            uv_dist,
+            epsilon,
+            xc,
+            yc,
+        )
+
+    def _set_mode_ct(self):
+        with contextlib.suppress(Exception):
+            super()._update_attribute(ATTR_COLOR_MODE, 0x02)
+
+    def _set_mode_xy(self):
+        with contextlib.suppress(Exception):
+            super()._update_attribute(ATTR_COLOR_MODE, 0x01)
+
+    async def _handle_move_to_color_temp(self, mired: int, trans: int):
+        dev_mired = self._map_ct_logical_to_device(mired)
+        self._log_ct_cmd(CMD_MOVE_TO_COLOR_TEMP, mired, dev_mired)
+        self._set_mode_ct()
+        return await self._emit_move_to_ct(dev_mired, trans)
+
+    async def _handle_xy_common(
+        self,
+        xf: float,
+        yf: float,
+        trans: int,
+        *,
+        kind: str,
+        x_in: int | None = None,
+        y_in: int | None = None,
+        h_deg: float | None = None,
+        s_raw: float | None = None,
+    ):
+        """Shared flow: decide CT snap, set mode, and emit."""
+        xc, yc = float(xf), float(yf)
+        decision = self._should_snap_to_ct(xc, yc)
+        if decision["snap"]:
+            dev_mired = self._map_ct_logical_to_device(int(decision["mired"]))
+            if kind == "xy":
+                self._log_xy_ct_snap(
+                    x_in,
+                    y_in,
+                    xc,
+                    yc,
+                    decision["uv_dist"],
+                    decision["mired"],
+                    dev_mired,
+                    decision["epsilon"],
+                    trans,
+                )
+            else:
+                self._log_hs_ct_snap(
+                    float(h_deg or 0.0),
+                    float(s_raw or 0.0),
+                    xc,
+                    yc,
+                    decision["uv_dist"],
+                    decision["mired"],
+                    dev_mired,
+                    decision["epsilon"],
+                    trans,
+                )
+            self._set_mode_ct()
+            return await self._emit_move_to_ct(dev_mired, trans)
+
+        if kind == "xy":
+            self._log_xy_no_snap(decision["uv_dist"], decision["epsilon"], xc, yc)
+        else:
+            self._log_hs_no_snap(decision["uv_dist"], decision["epsilon"], xc, yc)
+        xi, yi = self._float_to_xy16(xc), self._float_to_xy16(yc)
+        self._set_mode_xy()
+        return await self._emit_move_to_xy(xi, yi, trans)
+
+    async def _handle_move_to_color(self, x_in: int, y_in: int, trans: int):
+        xf, yf = self._xy16_to_float(x_in), self._xy16_to_float(y_in)
+        return await self._handle_xy_common(
+            xf,
+            yf,
+            trans,
+            kind="xy",
+            x_in=int(x_in),
+            y_in=int(y_in),
+        )
+
+    async def _handle_move_to_hs(
+        self, h_deg: float, s01: float, trans: int, enhanced: bool
+    ):
+        xf, yf = self._hsv_to_xy(h_deg, s01)
+        s_raw = s01 * 254.0
+        return await self._handle_xy_common(
+            xf,
+            yf,
+            trans,
+            kind="hs",
+            h_deg=float(h_deg),
+            s_raw=float(s_raw),
+        )
+
+    def _hsv_to_xy(self, h_deg: float, s01: float):
+        C = max(0.0, min(1.0, float(s01)))
+        hp = (float(h_deg) / 60.0) % 6.0
+        x_comp = C * (1 - abs((hp % 2.0) - 1.0))
+        if 0.0 <= hp < 1.0:
+            r1, g1, b1 = C, x_comp, 0.0
+        elif 1.0 <= hp < 2.0:
+            r1, g1, b1 = x_comp, C, 0.0
+        elif 2.0 <= hp < 3.0:
+            r1, g1, b1 = 0.0, C, x_comp
+        elif 3.0 <= hp < 4.0:
+            r1, g1, b1 = 0.0, x_comp, C
+        elif 4.0 <= hp < 5.0:
+            r1, g1, b1 = x_comp, 0.0, C
+        else:
+            r1, g1, b1 = C, 0.0, x_comp
+        # Inverse gamma to linear (use static helper to avoid scoping confusion)
+        rl, gl, bl = self._inv_gamma(r1), self._inv_gamma(g1), self._inv_gamma(b1)
+        x_val = 0.4124 * rl + 0.3576 * gl + 0.1805 * bl
+        y_val = 0.2126 * rl + 0.7152 * gl + 0.0722 * bl
+        z_val = 0.0193 * rl + 0.1192 * gl + 0.9505 * bl
+        denom = x_val + y_val + z_val
+        if denom <= 0:
+            return 0.3127, 0.3290
+        return x_val / denom, y_val / denom
+
+    @staticmethod
+    def _inv_gamma(u: float) -> float:
+        return (u / 12.92) if u <= 0.04045 else (((u + 0.055) / 1.055) ** 2.4)
+
+    def _parse_move_to_color_temp(self, args, kwargs):
+        """Return (mired, transition). Do not map/log here."""
+        mired = None
+        transition = None
+        if kwargs:
+            if "color_temp_mireds" in kwargs:
+                mired = kwargs.get("color_temp_mireds")
+            elif "color_temperature" in kwargs:
+                mired = kwargs.get("color_temperature")
+            elif "color_temp" in kwargs:
+                mired = kwargs.get("color_temp")
+            transition = kwargs.get("transition_time")
+        if mired is None and args:
+            mired = args[0]
+            transition = args[1] if len(args) > 1 else transition
+        if transition is None:
+            transition = DEFAULT_COLOR_TRANSITION_TENTHS
+        return int(mired if mired is not None else 0), int(transition)
+
+    def _parse_move_to_color(self, args, kwargs):
+        """Return (x16, y16, transition). Do not clamp/log here."""
+        x16 = None
+        y16 = None
+        transition = None
+        if kwargs:
+            x16 = kwargs.get("color_x", kwargs.get("current_x"))
+            y16 = kwargs.get("color_y", kwargs.get("current_y"))
+            transition = kwargs.get("transition_time")
+        if x16 is None and args:
+            x16 = args[0]
+        if y16 is None and args and len(args) > 1:
+            y16 = args[1]
+        if transition is None:
+            transition = (
+                args[2] if args and len(args) > 2 else DEFAULT_COLOR_TRANSITION_TENTHS
+            )
+        return int(x16 or 0), int(y16 or 0), int(transition)
+
+    def _parse_move_to_hs(self, args, kwargs, enhanced: bool):  # noqa: C901
+        """Return (hue_deg, sat01, transition). Input hue/sat untouched otherwise."""
+        hue = None
+        sat = None
+        transition = None
+        if kwargs:
+            hue = kwargs.get("enhanced_hue" if enhanced else "hue")
+            sat = kwargs.get("saturation")
+            transition = kwargs.get("transition_time")
+        if hue is None and args:
+            hue = args[0]
+        if sat is None and args and len(args) > 1:
+            sat = args[1]
+        if transition is None:
+            transition = (
+                args[2] if args and len(args) > 2 else DEFAULT_COLOR_TRANSITION_TENTHS
+            )
+        # Normalize
+        if enhanced:
+            h_deg = (int(hue or 0) % 65536) * (360.0 / 65535.0)
+        else:
+            h_deg = (int(hue or 0) % 255) * (360.0 / 254.0)
+        s01 = _clamp_value(int(sat or 0), 0, 254) / 254.0
+        return float(h_deg), float(s01), int(transition)
+
+    @staticmethod
+    def _xy16_to_float(v: int) -> float:
+        try:
+            iv = int(v)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        iv = max(iv, 0)
+        iv = min(iv, 65535)
+        return iv / 65535.0
+
+    @staticmethod
+    def _float_to_xy16(f: float) -> int:
+        try:
+            val = float(f)
+        except Exception:  # noqa: BLE001
+            val = 0.0
+        val = max(val, 0.0)
+        val = min(val, 1.0)
+        return int(round(val * 65535.0))
+
+    @staticmethod
+    def _xy_from_cct(cct: float):
+        T = float(cct)
+        T = max(T, 1667)
+        T = min(T, 25000)
+        if T <= 4000:
+            x = (
+                -0.2661239 * (1e9 / (T**3))
+                - 0.2343589 * (1e6 / (T**2))
+                + 0.8776956 * (1e3 / T)
+                + 0.179910
             )
         else:
-            _LOGGER.warning("Color.__init__: active=False (not target device)")
+            x = (
+                -3.0258469 * (1e9 / (T**3))
+                + 2.1070379 * (1e6 / (T**2))
+                + 0.2226347 * (1e3 / T)
+                + 0.240390
+            )
+        if T <= 2222:
+            y = -1.1063814 * (x**3) - 1.34811020 * (x**2) + 2.18555832 * x - 0.20219683
+        elif T <= 4000:
+            y = -0.9549476 * (x**3) - 1.37418593 * (x**2) + 2.09137015 * x - 0.16748867
+        else:
+            y = 3.0817580 * (x**3) - 5.87338670 * (x**2) + 3.75112997 * x - 0.37001483
+        return x, y
+
+    @staticmethod
+    def _cct_from_xy(x: float, y: float) -> float:
+        n = (x - 0.3320) / (y - 0.1858) if (y - 0.1858) != 0 else 0.0
+        cct = 449 * (n**3) + 3525 * (n**2) + 6823.3 * n + 5520.33
+        # Bound for sanity
+        cct = max(cct, 1000)
+        cct = min(cct, 25000)
+        return cct
+
+    @staticmethod
+    def _xy_to_uv(x: float, y: float):
+        denom = -2 * x + 12 * y + 3
+        if denom == 0:
+            return 0.0, 0.0
+        u = (4 * x) / denom
+        v = (9 * y) / denom
+        return u, v
+
+    def _nearest_ct_in_uv(self, x: float, y: float):
+        # Search logical CT range and find closest point on locus in u'v'
+        u_in, v_in = self._xy_to_uv(x, y)
+        best_mired = None
+        best_dist = float("inf")
+        best_xy = None
+        for mired in range(self.LOG_MIN, self.LOG_MAX + 1):
+            T = 1_000_000.0 / float(mired)
+            cx, cy = self._xy_from_cct(T)
+            u, v = self._xy_to_uv(cx, cy)
+            d = math.hypot(u - u_in, v - v_in)
+            if d < best_dist:
+                best_dist = d
+                best_mired = mired
+                best_xy = (cx, cy)
+        return best_mired, best_dist, best_xy
 
     async def bind(self):
         """Bind cluster and push corrected attributes to cache."""
         res = await super().bind()
-        if self._active():
-            super()._update_attribute(ATTR_CT_MIN, self.LOG_MIN)
-            super()._update_attribute(ATTR_CT_MAX, self.LOG_MAX)
-            _LOGGER.warning(
-                "Color.bind: enforced logical_ct_limits=%s-%s",
-                self.LOG_MIN,
-                self.LOG_MAX,
-            )
+        super()._update_attribute(ATTR_CT_MIN, self.LOG_MIN)
+        super()._update_attribute(ATTR_CT_MAX, self.LOG_MAX)
+        _LOGGER.warning(
+            "Color.bind: enforced logical_ct_limits=%s-%s",
+            self.LOG_MIN,
+            self.LOG_MAX,
+        )
         return res
 
-    # Helpers
     def _convert_device_mireds_to_logical(self, dev_mired: int) -> int:
         dev_mired = _clamp_value(int(dev_mired), self.DEV_MIN, self.DEV_MAX)
         logical = int(
@@ -304,46 +622,56 @@ class Color(CustomCluster, ZigpyColor):
         tsn=None,
         **kwargs,
     ):
-        """Intercept CT command to map logical mireds to device range when active."""
-        if not self._active():
-            return await super().command(
-                command_id,
-                *args,
-                manufacturer=manufacturer,
-                expect_reply=expect_reply,
-                tsn=tsn,
-                **kwargs,
-            )
-
-        # Move to Color Temperature (0x0A)
+        """Intercept Color commands to apply CT mapping and CT snapping."""
+        # Dispatcher per command
         if command_id == CMD_MOVE_TO_COLOR_TEMP:
+            # Narrow: only guard parsing issues; let handler errors surface
             try:
-                if kwargs:
-                    kw = dict(kwargs)
-                    for key in ("color_temp_mireds", "color_temperature", "color_temp"):
-                        if key in kw:
-                            before = kw[key]
-                            kw[key] = self._convert_logical_mireds_to_device(kw[key])
-                            _LOGGER.warning(
-                                "Color.command: cmd=0x%02X logical_ct=%s -> device_ct=%s",
-                                command_id,
-                                before,
-                                kw[key],
-                            )
-                            kwargs = kw
-                            break
-                elif args:
-                    before = args[0]
-                    mapped = self._convert_logical_mireds_to_device(args[0])
-                    args = (mapped,) + tuple(args[1:])
-                    _LOGGER.warning(
-                        "Color.command: cmd=0x%02X logical_ct=%s -> device_ct=%s",
-                        command_id,
-                        before,
-                        mapped,
-                    )
-            except Exception as ex:  # noqa: BLE001
-                _LOGGER.error("Color.command: exception mapping CT: %s", ex)
+                mired, trans = self._parse_move_to_color_temp(args, kwargs)
+            except (TypeError, ValueError, KeyError) as ex:
+                _LOGGER.error("Color.command: parse error for MoveToColorTemp: %s", ex)
+                return await super().command(
+                    command_id,
+                    *args,
+                    manufacturer=manufacturer,
+                    expect_reply=expect_reply,
+                    tsn=tsn,
+                    **kwargs,
+                )
+            return await self._handle_move_to_color_temp(mired, trans)
+        elif command_id == CMD_MOVE_TO_COLOR:
+            try:
+                x_in, y_in, trans = self._parse_move_to_color(args, kwargs)
+            except (TypeError, ValueError, KeyError) as ex:
+                _LOGGER.error("Color.command: parse error for MoveToColor: %s", ex)
+                return await super().command(
+                    command_id,
+                    *args,
+                    manufacturer=manufacturer,
+                    expect_reply=expect_reply,
+                    tsn=tsn,
+                    **kwargs,
+                )
+            return await self._handle_move_to_color(x_in, y_in, trans)
+        elif command_id in (CMD_MOVE_TO_HUE_SAT, CMD_ENHANCED_MOVE_TO_HUE_SAT):
+            enhanced = command_id == CMD_ENHANCED_MOVE_TO_HUE_SAT
+            try:
+                h_deg, s, trans = self._parse_move_to_hs(args, kwargs, enhanced)
+            except (TypeError, ValueError, KeyError) as ex:
+                _LOGGER.error(
+                    "Color.command: parse error for %s: %s",
+                    "EnhancedMoveToHueSat" if enhanced else "MoveToHueSat",
+                    ex,
+                )
+                return await super().command(
+                    command_id,
+                    *args,
+                    manufacturer=manufacturer,
+                    expect_reply=expect_reply,
+                    tsn=tsn,
+                    **kwargs,
+                )
+            return await self._handle_move_to_hs(h_deg, s, trans, enhanced)
 
         return await super().command(
             command_id,
@@ -354,46 +682,36 @@ class Color(CustomCluster, ZigpyColor):
             **kwargs,
         )
 
-    # NOTE: We intentionally do NOT override move_to_color_temp / move_to_color_temperature.
-    # Mapping is handled centrally in command() for CMD_MOVE_TO_COLOR_TEMP so that
-    # upstream ZHA cluster handlers receive the native zigpy return shape without
-    # any wrapper-induced signature issues.
-
-    # Attribute writes / reads
-    async def write_attributes(self, attrs, manufacturer=None):
+    async def write_attributes(self, attributes, manufacturer=None):
         """Rewrite CT attributes to device range on write when active."""
-        if not self._active():
-            return await super().write_attributes(attrs, manufacturer=manufacturer)
-
         try:
+            attrs = dict(attributes)
             for k, v in attrs.items():
                 if k in (ATTR_COLOR_TEMP, "color_temperature"):
                     before = v
-                    attrs[k] = self._convert_logical_mireds_to_device(v)
+                    attrs[k] = self._map_ct_logical_to_device(v)
                     _LOGGER.warning(
                         "Color.write_attributes: logical_ct=%s -> device_ct=%s",
                         before,
                         attrs[k],
                     )
+
         except Exception as ex:  # noqa: BLE001
             _LOGGER.error("Color.write_attributes: exception: %s", ex)
-        return await super().write_attributes(attrs, manufacturer=manufacturer)
+        return await super().write_attributes(attributes, manufacturer=manufacturer)
 
-    async def read_attributes(
+    async def read_attributes(  # noqa: C901
         self, attributes, allow_cache=True, only_cache=False, manufacturer=None
     ):
-        """Normalize CT attributes to logical range when active."""
+        """Normalize CT attributes to logical range."""
         _LOGGER.warning(
-            "Color.read_attributes(entry): attrs=%s type=%s allow_cache=%s only_cache=%s active=%s",
+            "Color.read_attributes(entry): attrs=%s type=%s allow_cache=%s only_cache=%s",
             attributes,
             type(attributes).__name__,
             allow_cache,
             only_cache,
-            self._active(),
         )
-        # Record which attributes were explicitly requested so we can inject
-        # logical defaults if the base read omits them (some stacks drop
-        # PhysicalMin/Max on read failures or manufacturer quirkiness).
+
         requested_ids = set()
         requested_names = set()
         try:
@@ -410,34 +728,28 @@ class Color(CustomCluster, ZigpyColor):
             only_cache=only_cache,
             manufacturer=manufacturer,
         )
-        # zigpy may return (success, failure); older path treated dict only.
-        if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+
+        original_is_tuple = isinstance(result_tuple, tuple) and len(result_tuple) == 2
+        if original_is_tuple:
             result, failure = result_tuple
             if not isinstance(result, dict):
                 result = dict(result or {})
             else:
-                # Make a shallow copy to avoid mutating zigpy internal mapping
                 result = dict(result)
         else:
-            result, failure = (
-                result_tuple if isinstance(result_tuple, dict) else {},
-                {},
-            )
-            # Ensure plain dict copy
+            failure = {}
+            result = result_tuple if isinstance(result_tuple, dict) else {}
             result = dict(result)
-        if not self._active():
-            return (result, failure)
 
-        # If requested but missing, inject logical values so caller always
-        # observes normalized physical min/max. Use constants rather than
-        # cache lookup to avoid chasing prior state.
         if (
             (
                 ATTR_CT_MIN in requested_ids
                 or "color_temp_physical_min_mireds" in requested_names
+                or "color_temp_physical_min" in requested_names
             )
             and ATTR_CT_MIN not in result
             and "color_temp_physical_min_mireds" not in result
+            and "color_temp_physical_min" not in result
         ):
             result[ATTR_CT_MIN] = self.LOG_MIN
             _LOGGER.warning(
@@ -448,9 +760,11 @@ class Color(CustomCluster, ZigpyColor):
             (
                 ATTR_CT_MAX in requested_ids
                 or "color_temp_physical_max_mireds" in requested_names
+                or "color_temp_physical_max" in requested_names
             )
             and ATTR_CT_MAX not in result
             and "color_temp_physical_max_mireds" not in result
+            and "color_temp_physical_max" not in result
         ):
             result[ATTR_CT_MAX] = self.LOG_MAX
             _LOGGER.warning(
@@ -465,11 +779,10 @@ class Color(CustomCluster, ZigpyColor):
                 result[name] = value
 
         set_val(ATTR_CT_MIN, "color_temp_physical_min_mireds", self.LOG_MIN)
+        set_val(ATTR_CT_MIN, "color_temp_physical_min", self.LOG_MIN)
         set_val(ATTR_CT_MAX, "color_temp_physical_max_mireds", self.LOG_MAX)
+        set_val(ATTR_CT_MAX, "color_temp_physical_max", self.LOG_MAX)
 
-        # Ensure physical min/max are always reported as logical values even if
-        # super() returned device-range values (cache mutation via
-        # _update_attribute doesn't rewrite the already-built result dict).
         if ATTR_CT_MIN in result:
             raw = result[ATTR_CT_MIN]
             if raw != self.LOG_MIN:
@@ -493,6 +806,19 @@ class Color(CustomCluster, ZigpyColor):
             else:
                 _LOGGER.warning(
                     "Color.read_attributes: CT_MIN(name) already logical=%s", raw
+                )
+        if "color_temp_physical_min" in result:
+            raw = result["color_temp_physical_min"]
+            if raw != self.LOG_MIN:
+                _LOGGER.warning(
+                    "Color.read_attributes: correcting CT_MIN(short) raw=%s -> %s",
+                    raw,
+                    self.LOG_MIN,
+                )
+                result["color_temp_physical_min"] = self.LOG_MIN
+            else:
+                _LOGGER.warning(
+                    "Color.read_attributes: CT_MIN(short) already logical=%s", raw
                 )
 
         if ATTR_CT_MAX in result:
@@ -519,12 +845,25 @@ class Color(CustomCluster, ZigpyColor):
                 _LOGGER.warning(
                     "Color.read_attributes: CT_MAX(name) already logical=%s", raw
                 )
+        if "color_temp_physical_max" in result:
+            raw = result["color_temp_physical_max"]
+            if raw != self.LOG_MAX:
+                _LOGGER.warning(
+                    "Color.read_attributes: correcting CT_MAX(short) raw=%s -> %s",
+                    raw,
+                    self.LOG_MAX,
+                )
+                result["color_temp_physical_max"] = self.LOG_MAX
+            else:
+                _LOGGER.warning(
+                    "Color.read_attributes: CT_MAX(short) already logical=%s", raw
+                )
 
         if ATTR_COLOR_TEMP in result or "color_temperature" in result:
             raw = result.get(ATTR_COLOR_TEMP, result.get("color_temperature"))
             if isinstance(raw, int):
                 try:
-                    mapped = self._convert_device_mireds_to_logical(raw)
+                    mapped = self._map_ct_device_to_logical(raw)
                     set_val(ATTR_COLOR_TEMP, "color_temperature", mapped)
                     _LOGGER.warning(
                         "Color.read_attributes: device_ct=%s -> logical_ct=%s",
@@ -540,39 +879,6 @@ class Color(CustomCluster, ZigpyColor):
                     type(raw).__name__,
                 )
 
-        # ColorCapabilities (no override, just visibility for debugging)
-        if ATTR_COLOR_CAPS in result or "color_capabilities" in result:
-            caps_val = result.get(ATTR_COLOR_CAPS, result.get("color_capabilities"))
-            if caps_val is None:
-                _LOGGER.warning(
-                    "Color.read_attributes: ColorCapabilities=None (no value)"
-                )
-            else:
-                try:
-                    val_int = int(caps_val)
-                    flags = []
-                    if val_int & 0x01:
-                        flags.append("HueSat")
-                    if val_int & 0x02:
-                        flags.append("EnhancedHue")
-                    if val_int & 0x04:
-                        flags.append("ColorLoop")
-                    if val_int & 0x08:
-                        flags.append("XY")
-                    if val_int & 0x10:
-                        flags.append("CT")
-                    _LOGGER.warning(
-                        "Color.read_attributes: ColorCapabilities=0x%02X (%s)",
-                        val_int,
-                        ",".join(flags) or "none",
-                    )
-                except Exception as ex:  # noqa: BLE001
-                    _LOGGER.error(
-                        "Color.read_attributes: exception decoding ColorCapabilities: %s",
-                        ex,
-                    )
-
-        # Exit summary (only log the keys actually returned)
         try:
             interesting = {}
             for key in (ATTR_CT_MIN, ATTR_CT_MAX, ATTR_COLOR_TEMP):
@@ -580,7 +886,9 @@ class Color(CustomCluster, ZigpyColor):
                     interesting[f"0x{key:04X}"] = result[key]
             for name in (
                 "color_temp_physical_min_mireds",
+                "color_temp_physical_min",
                 "color_temp_physical_max_mireds",
+                "color_temp_physical_max",
                 "color_temperature",
             ):
                 if name in result:
@@ -589,20 +897,22 @@ class Color(CustomCluster, ZigpyColor):
         except Exception:  # noqa: BLE001
             pass
 
-        return (result, failure)
+        return (result, failure) if original_is_tuple else result
 
-    # Cache normalization
     def _update_attribute(self, attrid, value):
-        if not self._active():
-            return super()._update_attribute(attrid, value)
         try:
             original = value
-            if attrid == ATTR_CT_MIN:  # PhysicalMin
+            if attrid == ATTR_CT_MIN:
                 value = self.LOG_MIN
-            elif attrid == ATTR_CT_MAX:  # PhysicalMax
+            elif attrid == ATTR_CT_MAX:
                 value = self.LOG_MAX
-            elif attrid == ATTR_COLOR_TEMP:  # CurrentColorTemperatureMireds
-                value = self._convert_device_mireds_to_logical(value)
+            elif attrid == ATTR_COLOR_TEMP:
+                value = self._map_ct_device_to_logical(value)
+                with contextlib.suppress(Exception):
+                    super()._update_attribute(ATTR_COLOR_MODE, 0x02)
+            elif attrid in (ATTR_CURRENT_X, ATTR_CURRENT_Y):
+                with contextlib.suppress(Exception):
+                    super()._update_attribute(ATTR_COLOR_MODE, 0x01)
             if original != value:
                 _LOGGER.warning(
                     "Color._update_attribute: attr=0x%04X raw=%s -> logical=%s",
@@ -615,104 +925,124 @@ class Color(CustomCluster, ZigpyColor):
         return super()._update_attribute(attrid, value)
 
 
-# Level cluster
-
-
 class LevelControl(CustomCluster, ZigpyLevelControl):
     """Perceptual mapping (+ anti-OFF guards) for the 3R ZL1.
 
     Uses LUTs for idempotent round-trip and hysteresis to stop slider bounce.
     """
 
-    # Gating
-    def _active(self) -> bool:
-        dev = getattr(self.endpoint, "device", None)
-        if not dev:
-            return False
-        if getattr(dev, "manufacturer", "") != TARGET_MANUFACTURER:
-            return False
-        if getattr(dev, "model", "") != TARGET_MODEL:
-            return False
-        if TARGET_SW_BUILD_ID:
-            sw = getattr(dev, "sw_build_id", "") or getattr(
-                dev, "software_build_id", ""
-            )
-            if sw != TARGET_SW_BUILD_ID:
-                return False
-        return True
-
-    # Init: build LUTs once
     def __init__(self, *args, **kwargs):
-        """Build LUTs and initialize hysteresis when active."""
+        """Build LUTs and initialize hysteresis."""
         super().__init__(*args, **kwargs)
         self._ha2dev = None
         self._dev2ha = None
         self._last_dev = None
         self._last_ha = None
-        self._hysteresis = 2  # device-level counts considered "close enough"
-        if self._active():
-            self._build_brightness_lookup_tables()
-            _LOGGER.warning(
-                "LevelControl.__init__: active=True hysteresis=%s", self._hysteresis
-            )
-        else:
-            _LOGGER.warning("LevelControl.__init__: active=False (not target device)")
+        self._hysteresis = HYSTERESIS_COUNTS
+        self._sticky_until = 0.0
+        self._build_brightness_lookup_tables()
+        _LOGGER.warning("LevelControl.__init__: hysteresis=%s", self._hysteresis)
 
     def _build_brightness_lookup_tables(self):
-        """Build monotonic LUTs so inverse(forward(h)) == h for reachable values."""
-        # Forward: HA(0..254) -> device(0..254)
-        ha2dev = [0] * (MAX_LEVEL + 1)
-        for h in range(MIN_LEVEL, MAX_LEVEL + 1):
-            ha2dev[h] = _map_ha_brightness_to_device(h, log=False)
+        """Attach precomputed brightness LUTs (deep copies to allow per-instance tweaks)."""
+        self._ha2dev = list(BRIGHTNESS_HA2DEV)
+        self._dev2ha = list(BRIGHTNESS_DEV2HA)
+        _LOGGER.warning(
+            "LevelControl._build_brightness_lookup_tables: tables_attached threshold=%s start_slope=%s end_slope=%s",
+            BRIGHTNESS_THRESHOLD_PERCENT,
+            START_SLOPE_NORM,
+            END_SLOPE_NORM,
+        )
 
-        # Inverse: device(0..254) -> nearest HA that produced it
-        dev2ha = [HA_MIN_LEVEL_INPUT] * (MAX_LEVEL + 1)
-        # Map each device value to the HA that yields the closest device output
-        for d in range(MIN_LEVEL, MAX_LEVEL + 1):
-            best_h = HA_MIN_LEVEL_INPUT
-            best_err = 9999
-            # Search HA domain that HA actually uses (3..254); include 0 for explicit off
-            for h in range(MIN_LEVEL, MAX_LEVEL + 1):
-                dv = ha2dev[h]
-                err = abs(dv - d)
-                if err < best_err or (err == best_err and h < best_h):
-                    best_err = err
-                    best_h = h
-                    if best_err == 0:
-                        break
-            dev2ha[d] = best_h
+    def _now(self) -> float:
+        return time.monotonic()
 
-        # Make both monotonic
-        for i in range(1, MAX_LEVEL + 1):
-            ha2dev[i] = max(ha2dev[i], ha2dev[i - 1])
-        for i in range(1, MAX_LEVEL + 1):
-            dev2ha[i] = max(dev2ha[i], dev2ha[i - 1])
-
-        self._ha2dev = ha2dev
-        self._dev2ha = dev2ha
-        _LOGGER.warning("LevelControl._build_brightness_lookup_tables: tables_built")
-
-    # Mapping helpers (LUT-backed)
     def _map_brightness_level(self, v: int) -> int:
-        if not self._active() or self._ha2dev is None:
-            return _map_ha_brightness_to_device(v)
+        if self._ha2dev is None:
+            v = _clamp_value(int(v), MIN_LEVEL, MAX_LEVEL)
+            p = _ha_raw_to_percent(v)
+            if p <= BRIGHTNESS_THRESHOLD_PERCENT:
+                mapped = 1 if p <= 2 else p
+            else:
+                frac = (p - BRIGHTNESS_THRESHOLD_PERCENT) / (
+                    100 - BRIGHTNESS_THRESHOLD_PERCENT
+                )
+                mapped = _clamp_value(
+                    int(
+                        round(
+                            BRIGHTNESS_THRESHOLD_PERCENT
+                            + frac * (DEVICE_LEVEL_MAX - BRIGHTNESS_THRESHOLD_PERCENT)
+                        )
+                    ),
+                    DEVICE_LEVEL_MIN,
+                    DEVICE_LEVEL_MAX,
+                )
+            _LOGGER.warning(
+                "LevelControl._map_brightness_level(fallback): ha=%s p=%s device=%s",
+                v,
+                p,
+                mapped,
+            )
+            return mapped
         v = _clamp_value(int(v), MIN_LEVEL, MAX_LEVEL)
+        p = _ha_raw_to_percent(v)
         mapped = int(self._ha2dev[v])
         _LOGGER.warning(
-            "LevelControl._map_brightness_level: ha=%s device=%s", v, mapped
+            "LevelControl._map_brightness_level: ha=%s p=%s device=%s (LUT)",
+            v,
+            p,
+            mapped,
         )
         return mapped
 
     def _convert_device_level_to_ha(self, dev: int) -> int:
-        if not self._active() or self._dev2ha is None:
-            return _map_device_brightness_to_ha(dev)
+        if self._dev2ha is None:
+            d = _clamp_value(int(dev), DEVICE_LEVEL_MIN, DEVICE_LEVEL_MAX)
+            if d == 0:
+                return 0
+            if d <= BRIGHTNESS_THRESHOLD_PERCENT:
+                return int(round(d * 255 / 100))
+            high_frac = (d - BRIGHTNESS_THRESHOLD_PERCENT) / (
+                DEVICE_LEVEL_MAX - BRIGHTNESS_THRESHOLD_PERCENT
+            )
+            p = BRIGHTNESS_THRESHOLD_PERCENT + high_frac * (
+                100 - BRIGHTNESS_THRESHOLD_PERCENT
+            )
+            return int(round(p * 255 / 100))
         d = _clamp_value(int(dev), MIN_LEVEL, MAX_LEVEL)
-        # Stickiness: echo last HA if near last device level
+        if self._last_ha is None:
+            _LOGGER.warning(
+                "LevelControl._convert_device_level_to_ha: device=%s -> ha=%s (group-compat identity)",
+                d,
+                d,
+            )
+            return int(d)
+        now = self._now()
+        if self._last_ha is not None and now <= (self._sticky_until or 0):
+            _LOGGER.warning(
+                "LevelControl._convert_device_level_to_ha: device=%s -> ha=%s (sticky-window remain=%.3fs)",
+                d,
+                self._last_ha,
+                (self._sticky_until - now),
+            )
+            return int(self._last_ha)
         if self._last_dev is not None and abs(d - self._last_dev) <= self._hysteresis:
-            return int(self._last_ha if self._last_ha is not None else self._dev2ha[d])
+            chosen = int(
+                self._last_ha if self._last_ha is not None else self._dev2ha[d]
+            )
+            _LOGGER.warning(
+                "LevelControl._convert_device_level_to_ha: device=%s -> ha=%s (hysteresis<=%s last_dev=%s)",
+                d,
+                chosen,
+                self._hysteresis,
+                self._last_dev,
+            )
+            return chosen
         mapped = int(self._dev2ha[d])
         _LOGGER.warning(
-            "LevelControl._convert_device_level_to_ha: device=%s ha=%s", d, mapped
+            "LevelControl._convert_device_level_to_ha: device=%s -> ha=%s (normal)",
+            d,
+            mapped,
         )
         return mapped
 
@@ -720,14 +1050,15 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         """Call after sending a level to make inbound reports sticky."""
         self._last_ha = _clamp_value(int(ha_level), MIN_LEVEL, MAX_LEVEL)
         self._last_dev = self._map_brightness_level(self._last_ha)
+        self._sticky_until = self._now() + STICKY_WINDOW_S
         _LOGGER.warning(
-            "LevelControl._remember_set: ha=%s last_dev=%s",
+            "LevelControl._remember_set: ha=%s last_dev=%s sticky_window=%.3fs",
             self._last_ha,
             self._last_dev,
+            STICKY_WINDOW_S,
         )
 
     def _avoid_zero_result(self, cmd_id: int, dev_level: int) -> int:
-        # Avoid OFF semantics on *with_on_off* when dev_level would be 0
         if (
             cmd_id
             in (
@@ -747,7 +1078,6 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         )
         return dev_level
 
-    # Commands
     async def command(
         self,
         command_id,
@@ -757,16 +1087,8 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         tsn=None,
         **kwargs,
     ):
-        """Map HA level to device level and apply anti-OFF guards when active."""
-        if not self._active():
-            return await super().command(
-                command_id,
-                *args,
-                manufacturer=manufacturer,
-                expect_reply=expect_reply,
-                tsn=tsn,
-                **kwargs,
-            )
+        """Map HA level to device level and apply anti-OFF guards."""
+
         _LOGGER.warning(
             "LevelControl.command: cmd=0x%02X args=%s kwargs=%s",
             command_id,
@@ -774,11 +1096,9 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
             kwargs,
         )
 
-        # Handle move-like commands
         if command_id in (CMD_MOVE_TO_LEVEL, CMD_MOVE_TO_LEVEL_WITH_ON_OFF):
             return await self._handle_move_command(command_id, *args)
 
-        # Handle step-like commands
         elif command_id in (CMD_STEP, CMD_STEP_WITH_ON_OFF):
             return await self._handle_step_command(command_id, *args)
 
@@ -788,13 +1108,14 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         level = args[0] if args else None
         transition_time = args[1] if len(args) >= 2 else DEFAULT_TRANSITION_TIME
         if level is not None:
-            # Remember for stickiness; map via LUT
             self._remember_set(int(level))
+            p = _ha_raw_to_percent(int(level))
             mapped_level = self._map_brightness_level(level)
             _LOGGER.warning(
-                "LevelControl._handle_move_command: cmd=0x%02X ha=%s mapped=%s transition=%s",
+                "LevelControl._handle_move_command: cmd=0x%02X ha=%s p=%s mapped=%s transition=%s",
                 command_id,
                 level,
+                p,
                 mapped_level,
                 transition_time,
             )
@@ -817,7 +1138,6 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         step_size = args[1] if len(args) > 1 else 0
         transition_time = args[2] if len(args) > 2 else DEFAULT_TRANSITION_TIME
         if step_mode is not None and step_size is not None:
-            # Read HA-normalized current level
             cur = await self.read_attributes([ATTR_CURRENT_LEVEL])
             current_level = DEFAULT_LEVEL
             if isinstance(cur, dict):
@@ -832,7 +1152,6 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
             else:
                 projected = current_level
 
-            # Avoid OFF semantics when stepping to/below 0 with WITH_ON_OFF
             if command_id == CMD_STEP_WITH_ON_OFF and projected <= 0:
                 return await super().command(CMD_MOVE_TO_LEVEL, 1, transition_time)
 
@@ -855,91 +1174,93 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
         )
         return await super().command(command_id, *args)
 
-    # Convenience wrappers route via command IDs
     async def move_to_level(self, level, transition_time):
-        """Route to command 0x00 with mapping and stickiness when active."""
-        if not self._active():
-            return await super().command(CMD_MOVE_TO_LEVEL, level, transition_time)
+        """Route to command 0x00 with mapping and stickiness."""
+
         self._remember_set(int(level))
+        p = _ha_raw_to_percent(int(level))
         mapped = self._map_brightness_level(level)
         if int(level) > 0 and mapped == 0:
             mapped = 1
         _LOGGER.warning(
-            "LevelControl.move_to_level: ha=%s mapped=%s transition=%s",
+            "LevelControl.move_to_level: ha=%s p=%s mapped=%s transition=%s",
             level,
+            p,
             mapped,
             transition_time,
         )
-        # Call base to avoid re-mapping
         return await super().command(CMD_MOVE_TO_LEVEL, mapped, transition_time)
 
     async def move_to_level_with_on_off(self, level, transition_time):
-        """Route to command 0x04 with mapping and anti-OFF rewrite when active."""
-        if not self._active():
-            return await super().command(
-                CMD_MOVE_TO_LEVEL_WITH_ON_OFF, level, transition_time
-            )
+        """Route to command 0x04 with mapping and anti-OFF rewrite."""
+
         self._remember_set(int(level))
+        p = _ha_raw_to_percent(int(level))
         mapped = self._map_brightness_level(level)
         mapped = self._avoid_zero_result(CMD_MOVE_TO_LEVEL_WITH_ON_OFF, mapped)
         if mapped <= 1 and int(level) > 0:
-            # Rewrite to plain move_to_level at 1
             return await super().command(CMD_MOVE_TO_LEVEL, 1, transition_time)
         _LOGGER.warning(
-            "LevelControl.move_to_level_with_on_off: ha=%s mapped=%s transition=%s",
+            "LevelControl.move_to_level_with_on_off: ha=%s p=%s mapped=%s transition=%s",
             level,
+            p,
             mapped,
             transition_time,
         )
-        # Call base to avoid re-mapping
         return await super().command(
             CMD_MOVE_TO_LEVEL_WITH_ON_OFF, mapped, transition_time
         )
 
     async def write_attributes(self, attributes, manufacturer=None):
-        """Rewrite current_level writes to mapped device values when active."""
-        if not self._active():
-            return await super().write_attributes(attributes, manufacturer=manufacturer)
+        """Rewrite current_level writes to mapped device values."""
+
         try:
             attrs = dict(attributes)
             for k, v in attrs.items():
                 if k in (ATTR_CURRENT_LEVEL, "current_level", "level"):
-                    self._remember_set(int(v))
-                    attrs[k] = self._map_brightness_level(v)
+                    iv = int(v)
+                    self._remember_set(iv)
+                    p = _ha_raw_to_percent(iv)
+                    attrs[k] = self._map_brightness_level(iv)
                     _LOGGER.warning(
-                        "LevelControl.write_attributes: ha=%s -> device=%s", v, attrs[k]
+                        "LevelControl.write_attributes: ha=%s p=%s -> device=%s",
+                        iv,
+                        p,
+                        attrs[k],
                     )
             attributes = attrs
         except Exception as ex:  # noqa: BLE001
             _LOGGER.error("LevelControl.write_attributes: exception: %s", ex)
         return await super().write_attributes(attributes, manufacturer=manufacturer)
 
-    # Normalize inbound/cache to avoid slider bounce
     def _update_attribute(self, attrid, value):
-        if not self._active():
-            return super()._update_attribute(attrid, value)
         try:
             if attrid == ATTR_CURRENT_LEVEL:  # CurrentLevel
                 raw = int(value)
                 value = self._convert_device_level_to_ha(int(value))
                 _LOGGER.warning(
-                    "LevelControl._update_attribute: device=%s -> ha=%s", raw, value
+                    "LevelControl._update_attribute: device=%s -> ha=%s (sticky_until=%.3f now=%.3f last_dev=%s last_ha=%s)",
+                    raw,
+                    value,
+                    self._sticky_until,
+                    self._now(),
+                    self._last_dev,
+                    self._last_ha,
                 )
         except Exception as ex:  # noqa: BLE001
             _LOGGER.error("LevelControl._update_attribute: exception: %s", ex)
         return super()._update_attribute(attrid, value)
 
-    async def read_attributes(
+    async def read_attributes(  # noqa: C901
         self, attributes, allow_cache=True, only_cache=False, manufacturer=None
     ):
-        """Normalize current_level results to HA levels when active."""
+        """Normalize current_level results to HA levels."""
         _LOGGER.warning(
-            "LevelControl.read_attributes(entry): attrs=%s type=%s allow_cache=%s only_cache=%s active=%s",
+            "LevelControl.read_attributes(entry): attrs=%s type=%s allow_cache=%s only_cache=%s",
             attributes,
             type(attributes).__name__,
             allow_cache,
             only_cache,
-            self._active(),
         )
         result = await super().read_attributes(
             attributes,
@@ -947,8 +1268,6 @@ class LevelControl(CustomCluster, ZigpyLevelControl):
             only_cache=only_cache,
             manufacturer=manufacturer,
         )
-        if not self._active():
-            return result
         if ATTR_CURRENT_LEVEL in result or "current_level" in result:
             raw = result.get(ATTR_CURRENT_LEVEL, result.get("current_level"))
             try:
